@@ -23,7 +23,7 @@ async def cleanup_old_entries():
     while True:
         try:
             now = datetime.now()
-            ten_minutes_ago = now - timedelta(minutes=1400)
+            ten_minutes_ago = now - timedelta(minutes=120)
             to_delete = []
             for id, entry in db.items():
                 if "created_at" not in entry:
