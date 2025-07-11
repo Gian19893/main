@@ -11,20 +11,25 @@ import mimetypes
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, messaging
+import json  # 👈 aggiunto per parsing della chiave
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.DEBUG)
 
-# Configurazione Firebase
-cred = credentials.Certificate("serviceAccountKey.json") 
+# 🔧 Configurazione Firebase modificata per usare variabile d'ambiente
+firebase_key_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if not firebase_key_json:
+    raise RuntimeError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable")
+
+firebase_creds = json.loads(firebase_key_json)
+cred = credentials.Certificate(firebase_creds)
 firebase_admin.initialize_app(cred)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 db = {}
-# Mappa device_id -> token FCM
-device_registrations: Dict[str, str] = {}  
+device_registrations: Dict[str, str] = {}
 upload_lock = asyncio.Lock()
 upload_queue = asyncio.Queue()
 
@@ -90,7 +95,6 @@ async def process_upload_job(job):
             "created_at": time.time()
         }
 
-        # Invia notifica SOLO al dispositivo che ha scansionato l'ID
         await send_targeted_fcm_notification(scanner_device_id, id_str, text, file_type)
         
         logger.info(f"Upload successful for id={id_str}")
@@ -180,7 +184,7 @@ async def protocol_upload(
     id: str = Form(...),
     frequency: Optional[int] = Form(0),
     file: Optional[UploadFile] = File(None),
-    scanner_device_id: str = Form(...)  # ID del dispositivo che ha scansionato
+    scanner_device_id: str = Form(...)
 ):
     logger.debug(f"Received upload request from device {scanner_device_id}")
     try:
