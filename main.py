@@ -3,21 +3,39 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
-from typing import Optional
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request, Body
+from typing import Optional, Dict
+from fastapi.responses import FileResponse, JSONResponse
 from contextlib import asynccontextmanager
 import mimetypes
+from pydantic import BaseModel
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.DEBUG)
+
+# Configurazione Firebase
+cred = credentials.Certificate("serviceAccountKey.json") 
+firebase_admin.initialize_app(cred)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 db = {}
+# Mappa device_id -> token FCM
+device_registrations: Dict[str, str] = {}  
 upload_lock = asyncio.Lock()
 upload_queue = asyncio.Queue()
+
+class FcmTokenRequest(BaseModel):
+    token: str
+    device_id: str
+
+class NotificationRequest(BaseModel):
+    id: str
+    text: str
+    file_type: Optional[str] = None
 
 async def cleanup_old_entries():
     while True:
@@ -46,8 +64,8 @@ async def cleanup_old_entries():
             await asyncio.sleep(60)
 
 async def process_upload_job(job):
-    id_str, text, file_content, filename, content_type, frequency = job
-    logger.debug(f"Processing upload job: id={id_str}, frequency={frequency}")
+    id_str, text, file_content, filename, content_type, frequency, scanner_device_id = job
+    logger.debug(f"Processing upload job: id={id_str}, device_id={scanner_device_id}")
 
     async with upload_lock:
         file_path = None
@@ -67,12 +85,61 @@ async def process_upload_job(job):
             "frequency": frequency,
             "file_path": file_path,
             "file_type": file_type,
+            "scanner_device_id": scanner_device_id,
             "consumed": False,
             "created_at": time.time()
         }
 
+        # Invia notifica SOLO al dispositivo che ha scansionato l'ID
+        await send_targeted_fcm_notification(scanner_device_id, id_str, text, file_type)
+        
         logger.info(f"Upload successful for id={id_str}")
     return id_str
+
+async def send_targeted_fcm_notification(device_id: str, data_id: str, text: str, file_type: Optional[str]):
+    if device_id not in device_registrations:
+        logger.warning(f"No FCM token registered for device {device_id}")
+        return
+
+    token = device_registrations[device_id]
+    
+    message = messaging.Message(
+        token=token,
+        data={
+            "id": data_id,
+            "text": text,
+            "fileType": file_type or "Nessun file"
+        },
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                title="Nuovi dati disponibili",
+                body=f"ID: {data_id} - {text[:30]}...",
+                priority="high",
+                visibility="public",
+                channel_id="HIGH_PRIORITY_CHANNEL"
+            )
+        ),
+        apns=messaging.APNSConfig(
+            headers={"apns-priority": "10"},
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(
+                    content_available=True,
+                    alert=messaging.ApsAlert(
+                        title="Nuovi dati disponibili",
+                        body=f"ID: {data_id} - {text[:30]}..."
+                    ),
+                    sound="default"
+                )
+            )
+        )
+    )
+
+    try:
+        response = messaging.send(message)
+        logger.info(f"Sent targeted FCM notification to device {device_id}")
+    except Exception as e:
+        logger.error(f"Error sending FCM to device {device_id}: {e}")
 
 async def upload_worker():
     logger.info("Upload worker started")
@@ -101,19 +168,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.post("/fcm/register")
+async def register_fcm_token(request: FcmTokenRequest):
+    device_registrations[request.device_id] = request.token
+    logger.info(f"Registered FCM token for device {request.device_id}")
+    return {"status": "success", "message": "Token registered"}
+
 @app.post("/protocol/upload")
 async def protocol_upload(
     text: str = Form(...),
     id: str = Form(...),
     frequency: Optional[int] = Form(0),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    scanner_device_id: str = Form(...)  # ID del dispositivo che ha scansionato
 ):
-    logger.debug(f"Received upload request: id={id}, frequency={frequency}, file={file.filename if file else 'None'}")
+    logger.debug(f"Received upload request from device {scanner_device_id}")
     try:
         file_content = await file.read() if file else None
         filename = file.filename if file else ""
         content_type = file.content_type if file else ""
-        await upload_queue.put((id, text, file_content, filename, content_type, frequency))
+        await upload_queue.put((id, text, file_content, filename, content_type, frequency, scanner_device_id))
         return {"status": "queued", "id": id}
     except Exception as e:
         logger.error(f"Upload failed: {e}", exc_info=True)
@@ -140,6 +214,7 @@ async def protocol_get(id: str, request: Request):
         "text": entry["text"],
         "fileUrl": file_url,
         "fileType": entry["file_type"],
+        "scanner_device_id": entry["scanner_device_id"],
         "consumed": entry["consumed"],
         "created_at": entry["created_at"]
     }
@@ -173,6 +248,7 @@ async def get_status():
     return {
         "status": "running",
         "entries_count": len(db),
+        "registered_devices": len(device_registrations),
         "upload_queue_size": upload_queue.qsize(),
         "timestamp": time.time()
     }

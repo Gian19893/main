@@ -2,4 +2,4 @@ fastapi
 uvicorn
 gunicorn
 python-multipart
-
+firebase-admin==6.2.0  
