@@ -207,11 +207,23 @@ async def download_file(id: str):
     if id not in db or not db[id]["file_path"] or not os.path.exists(db[id]["file_path"]):
         raise HTTPException(status_code=404, detail="File not found")
 
+    file_path = db[id]["file_path"]
+    file_size = os.path.getsize(file_path)
+    
+    if file_size == 0:
+        raise HTTPException(status_code=500, detail="File is empty (0 bytes)")
+    
     db[id]["created_at"] = time.time()
+    
     return FileResponse(
-        db[id]["file_path"],
+        file_path,
         media_type=db[id]["file_type"],
-        filename=f"file_{id}{os.path.splitext(db[id]['file_path'])[1]}"
+        filename=f"file_{id}{os.path.splitext(file_path)[1]}",
+        headers={
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f"attachment; filename=file_{id}{os.path.splitext(file_path)[1]}"
+        }
     )
 
 @app.get("/image/{image_name}")
